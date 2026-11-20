@@ -1,0 +1,133 @@
+version: "1.0"
+org_id: "00000000-0000-0000-0000-000000000001"
+policy_id: "prod-to-staging-gdpr-v1"
+frameworks:
+  - GDPR
+  - NDPR
+  - PCI_DSS
+
+source:
+  engine: postgresql
+  env_dsn: SANITIZEDB_SOURCE_DSN
+
+target:
+  engine: postgresql
+  env_dsn: SANITIZEDB_TARGET_DSN
+
+runtime:
+  channel_capacity: 512
+  worker_concurrency: 4
+  strict_drift_gate: true
+
+tables:
+  - schema: public
+    name: users
+    truncate_target: true
+    columns:
+      - name: id
+        strategy: PASS_THROUGH
+      - name: external_uid
+        strategy: PASS_THROUGH
+      - name: full_name
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: FULL_NAME
+        deterministic_domain: identity.full_name
+      - name: email
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: EMAIL
+        deterministic_domain: identity.email
+      - name: phone_number
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: PHONE
+        deterministic_domain: identity.phone
+      - name: national_id
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: NATIONAL_ID
+        deterministic_domain: identity.national_id
+      - name: date_of_birth
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: DATE_OF_BIRTH
+      - name: signup_ip
+        strategy: PARTIAL_MASK
+        preserve_prefix: 4
+        preserve_suffix: 0
+      - name: country_code
+        strategy: PASS_THROUGH
+      - name: tier
+        strategy: PASS_THROUGH
+      - name: created_at
+        strategy: PASS_THROUGH
+
+  - schema: public
+    name: payment_methods
+    truncate_target: true
+    columns:
+      - name: id
+        strategy: PASS_THROUGH
+      - name: user_id
+        strategy: PASS_THROUGH
+      - name: cardholder_name
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: FULL_NAME
+        deterministic_domain: identity.full_name
+      - name: card_number
+        strategy: PARTIAL_MASK
+        preserve_prefix: 0
+        preserve_suffix: 4
+      - name: billing_email
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: EMAIL
+        deterministic_domain: identity.email
+      - name: billing_zip
+        strategy: PARTIAL_MASK
+        preserve_prefix: 2
+        preserve_suffix: 0
+      - name: created_at
+        strategy: PASS_THROUGH
+
+  - schema: public
+    name: orders
+    truncate_target: true
+    columns:
+      - name: id
+        strategy: PASS_THROUGH
+      - name: user_id
+        strategy: PASS_THROUGH
+      - name: customer_email
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: EMAIL
+        deterministic_domain: identity.email
+      - name: shipping_address
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: STREET_ADDRESS
+      - name: amount_cents
+        strategy: PASS_THROUGH
+      - name: currency
+        strategy: PASS_THROUGH
+      - name: status
+        strategy: PASS_THROUGH
+      - name: created_at
+        strategy: PASS_THROUGH
+
+  - schema: public
+    name: audit_logs
+    truncate_target: true
+    columns:
+      - name: id
+        strategy: PASS_THROUGH
+      - name: user_id
+        strategy: PASS_THROUGH
+      - name: actor_email
+        strategy: DETERMINISTIC_FAKE
+        semantic_type: EMAIL
+        deterministic_domain: identity.email
+      - name: ip_address
+        strategy: PARTIAL_MASK
+        preserve_prefix: 4
+        preserve_suffix: 0
+      - name: action
+        strategy: PASS_THROUGH
+      - name: user_agent
+        strategy: PASS_THROUGH
+      - name: created_at
+        strategy: PASS_THROUGH

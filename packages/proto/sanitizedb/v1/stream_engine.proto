@@ -1,0 +1,249 @@
+syntax = "proto3";
+
+package sanitizedb.v1;
+
+option go_package = "github.com/sanitizedb/sanitizedb/services/orchestrator-cli/gen/sanitizedb/v1;sanitizedbv1";
+option java_multiple_files = true;
+option java_package = "com.sanitizedb.proto.v1";
+
+import "google/protobuf/timestamp.proto";
+
+// =============================================================================
+// StreamEngineService: High-throughput data-plane gRPC contract between the
+// Go Orchestrator (Control Plane) and Rust Stream Engine (Zero-Leak Worker).
+// =============================================================================
+service StreamEngineService {
+  // Inspect source DB schema, foreign keys, and run in-memory PII heuristic scan.
+  rpc InspectSchema(InspectSchemaRequest) returns (InspectSchemaResponse);
+
+  // Stream-mask N sample rows (default 10) purely in RAM for Web Console preview.
+  // Never writes to target DB or local disk.
+  rpc PreviewMasking(PreviewMaskingRequest) returns (PreviewMaskingResponse);
+
+  // Execute a full streaming anonymization job with server-streamed telemetry
+  // (rows/sec, ETA, RSS memory, per-table completion, and cryptographic attestation).
+  rpc ExecuteSanitizationJob(ExecuteJobRequest) returns (stream SyncProgressEvent);
+
+  // Gracefully abort a running job and immediately zeroize in-memory salt buffers.
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+
+  // Liveness & capacity check for Orchestrator worker scheduling.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// -----------------------------------------------------------------------------
+// Connection & Ephemeral Credential Envelope
+// -----------------------------------------------------------------------------
+enum DatabaseEngine {
+  DATABASE_ENGINE_UNSPECIFIED = 0;
+  DATABASE_ENGINE_POSTGRESQL = 1;
+  DATABASE_ENGINE_MYSQL = 2;
+}
+
+message ConnectionEndpoint {
+  DatabaseEngine engine = 1;
+  // Ephemeral DSN resolved from HashiCorp Vault/KMS by Go Orchestrator over mTLS.
+  // Rust engine holds this strictly in zeroize-wrapped RAM for job lifetime.
+  string ephemeral_dsn = 2;
+  uint32 max_connections = 3;
+  uint32 statement_timeout_ms = 4;
+}
+
+// -----------------------------------------------------------------------------
+// Masking Strategy & Policy Definitions
+// -----------------------------------------------------------------------------
+enum MaskingStrategy {
+  MASKING_STRATEGY_UNSPECIFIED = 0;
+  MASKING_STRATEGY_DETERMINISTIC_FAKE = 1; // HMAC-SHA256 keyed PRNG -> fake-rs (preserves FK & join consistency)
+  MASKING_STRATEGY_NULLIFY = 2;            // Replace value with SQL NULL (or empty string if NOT NULL)
+  MASKING_STRATEGY_PARTIAL_MASK = 3;       // Preserve format/suffix e.g. ****-****-****-0366 or a***@finbank-corp.ng
+  MASKING_STRATEGY_SHUFFLE = 4;            // Deterministic Fisher-Yates permutation within bounded in-memory window
+  MASKING_STRATEGY_PASS_THROUGH = 5;       // Emit value unmodified (allowed only for non-PII columns)
+}
+
+enum PiiCategory {
+  PII_CATEGORY_UNSPECIFIED = 0;
+  PII_CATEGORY_NONE = 1;
+  PII_CATEGORY_EMAIL = 2;
+  PII_CATEGORY_PHONE = 3;
+  PII_CATEGORY_CREDIT_CARD = 4;
+  PII_CATEGORY_NATIONAL_ID = 5;
+  PII_CATEGORY_IP_ADDRESS = 6;
+  PII_CATEGORY_FULL_NAME = 7;
+  PII_CATEGORY_STREET_ADDRESS = 8;
+  PII_CATEGORY_DATE_OF_BIRTH = 9;
+}
+
+message ColumnMaskingRule {
+  string column_name = 1;
+  MaskingStrategy strategy = 2;
+  // Semantic generator hint when strategy == DETERMINISTIC_FAKE (e.g. EMAIL, FULL_NAME, PHONE)
+  PiiCategory semantic_type = 3;
+  // Optional domain group so different column names (users.email, orders.customer_email,
+  // audit_logs.actor_email) derive the exact same HMAC domain tag and hash identically.
+  string deterministic_domain = 4;
+  // Partial mask config: number of leading/trailing chars to preserve.
+  uint32 preserve_prefix_chars = 5;
+  uint32 preserve_suffix_chars = 6;
+  bool preserve_nulls = 7;
+}
+
+message TablePolicy {
+  string schema_name = 1;
+  string table_name = 2;
+  bool truncate_target_before_load = 3;
+  uint32 batch_size = 4;
+  repeated ColumnMaskingRule column_rules = 5;
+}
+
+// -----------------------------------------------------------------------------
+// InspectSchema RPC
+// -----------------------------------------------------------------------------
+message InspectSchemaRequest {
+  string request_id = 1;
+  ConnectionEndpoint source = 2;
+  uint32 sample_rows_per_table = 3; // Default 50 rows sampled in RAM for PII heuristics
+  repeated string include_schemas = 4;
+}
+
+message ForeignKeyRef {
+  string constraint_name = 1;
+  string source_column = 2;
+  string target_schema = 3;
+  string target_table = 4;
+  string target_column = 5;
+}
+
+message ColumnMetadata {
+  string name = 1;
+  string data_type = 2;
+  bool is_nullable = 3;
+  bool is_primary_key = 4;
+  PiiCategory detected_pii = 5;
+  float pii_confidence = 6; // 0.0 - 1.0 score combining column name heuristics + value regex
+  string detection_reason = 7;
+}
+
+message TableMetadata {
+  string schema_name = 1;
+  string table_name = 2;
+  int64 estimated_row_count = 3;
+  repeated ColumnMetadata columns = 4;
+  repeated ForeignKeyRef foreign_keys = 5;
+}
+
+message InspectSchemaResponse {
+  string schema_fingerprint_sha256 = 1;
+  repeated TableMetadata tables = 2;
+  google.protobuf.Timestamp inspected_at = 3;
+}
+
+// -----------------------------------------------------------------------------
+// PreviewMasking RPC
+// -----------------------------------------------------------------------------
+message PreviewMaskingRequest {
+  string job_salt_hex = 1; // Ephemeral 32-byte salt for preview determinism
+  ConnectionEndpoint source = 2;
+  TablePolicy table_policy = 3;
+  uint32 sample_limit = 4; // Capped at 10 rows
+}
+
+message PreviewRow {
+  // Ordered column values after applying masking rules. Raw PII is NEVER returned.
+  map<string, string> masked_values = 1;
+  // Optional redacted fingerprint (e.g. "sha256:9f2a...c1") so UI can verify determinism
+  map<string, string> input_fingerprints = 2;
+}
+
+message PreviewMaskingResponse {
+  string table_name = 1;
+  repeated string column_order = 2;
+  repeated PreviewRow rows = 3;
+}
+
+// -----------------------------------------------------------------------------
+// ExecuteSanitizationJob RPC (Server-Streaming)
+// -----------------------------------------------------------------------------
+message ExecuteJobRequest {
+  string job_id = 1;
+  string org_id = 2;
+  string policy_id = 3;
+  uint32 policy_version = 4;
+  // 256-bit per-job HMAC salt generated by KMS/Vault; zeroized on worker exit.
+  bytes ephemeral_job_salt = 5;
+  ConnectionEndpoint source = 6;
+  ConnectionEndpoint target = 7;
+  // Topologically sorted tables (parents before children to satisfy FK constraints).
+  repeated TablePolicy tables = 8;
+  // Backpressure tuning for Rust tokio::sync::mpsc bounded channel.
+  uint32 channel_capacity = 9;
+  uint32 worker_concurrency = 10;
+  bool disable_target_triggers = 11;
+}
+
+enum JobPhase {
+  JOB_PHASE_UNSPECIFIED = 0;
+  JOB_PHASE_INITIALIZING = 1;
+  JOB_PHASE_STREAMING = 2;
+  JOB_PHASE_FINALIZING = 3;
+  JOB_PHASE_COMPLETED = 4;
+  JOB_PHASE_FAILED = 5;
+  JOB_PHASE_CANCELLED = 6;
+}
+
+message TableProgress {
+  string qualified_name = 1; // e.g., public.users
+  uint64 rows_processed = 2;
+  uint64 estimated_total_rows = 3;
+  bool completed = 4;
+  uint64 duration_ms = 5;
+}
+
+// Cryptographic execution summary sent in the final COMPLETED event for Governance Core.
+message RunAttestation {
+  string engine_version = 1;
+  string salt_commitment_sha256 = 2; // SHA-256(ephemeral_job_salt) — proves salt without leaking it
+  string rules_digest_sha256 = 3;
+  uint64 total_rows_masked = 4;
+  uint64 total_fields_transformed = 5;
+  bool zero_disk_writes_verified = 6; // Asserts no temp files / spill buffers were created
+  google.protobuf.Timestamp completed_at = 7;
+  uint64 duration_ms = 8;
+}
+
+message SyncProgressEvent {
+  string job_id = 1;
+  JobPhase phase = 2;
+  uint64 total_rows_processed = 3;
+  uint64 total_bytes_streamed = 4;
+  double rows_per_second = 5;
+  uint64 eta_seconds = 6;
+  uint64 worker_rss_memory_bytes = 7;
+  uint32 active_channel_depth = 8; // Backpressure observability metric
+  repeated TableProgress tables = 9;
+  string error_detail = 10;
+  RunAttestation attestation = 11; // Populated only when phase == JOB_PHASE_COMPLETED
+  google.protobuf.Timestamp emitted_at = 12;
+}
+
+// -----------------------------------------------------------------------------
+// CancelJob & HealthCheck RPCs
+// -----------------------------------------------------------------------------
+message CancelJobRequest {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message CancelJobResponse {
+  bool cancelled = 1;
+  bool salt_zeroized = 2;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;
+  uint32 active_jobs = 2;
+  uint64 rss_memory_bytes = 3;
+  string engine_version = 4;
+}

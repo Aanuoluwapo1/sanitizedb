@@ -1,0 +1,53 @@
+# =============================================================================
+# SanitizeDB Monorepo .gitignore
+# =============================================================================
+
+# Rust
+services/stream-engine/target/
+**/Cargo.lock
+
+# Go
+services/orchestrator-cli/bin/
+services/orchestrator-cli/sanitizedb
+services/orchestrator-cli/*.exe
+*.test
+*.out
+
+# Java / Maven
+services/governance-core/target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/
+
+# Node / React / Vite
+apps/web-console/node_modules/
+apps/web-console/dist/
+apps/web-console/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment, Secrets & Credentials (NEVER COMMIT)
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.jks
+*secret*
+!infra/postgres/control-plane/001_init_schema.sql
+!infra/postgres/control-plane/002_dev_seed.sql
+!infra/postgres/mock-source/001_dirty_pii_seed.sql
+!infra/postgres/mock-target/001_empty_staging_schema.sql
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.log

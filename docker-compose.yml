@@ -1,0 +1,195 @@
+name: sanitizedb
+
+# =============================================================================
+# Network Segmentation (Defense-in-Depth):
+#   - data-plane-net: ONLY source-db, target-db, and stream-engine (Rust)
+#   - control-net:    orchestrator, governance-core, control-plane-db, vault, web-console
+# Notice that governance-core and web-console NEVER have a network route to
+# source-db (production PII).
+# =============================================================================
+networks:
+  data-plane-net:
+    driver: bridge
+  control-net:
+    driver: bridge
+
+volumes:
+  control_plane_pgdata:
+  source_pgdata:
+  target_pgdata:
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Mock Production Source DB (Pre-seeded with realistic dirty PII)
+  # ---------------------------------------------------------------------------
+  source-db:
+    image: postgres:16-alpine
+    container_name: sanitizedb-source-db
+    environment:
+      POSTGRES_DB: prod_app
+      POSTGRES_USER: prod_readonly
+      POSTGRES_PASSWORD: prod_dev_password_only
+    ports:
+      - "5433:5432"
+    volumes:
+      - source_pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/mock-source:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data-plane-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prod_readonly -d prod_app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # 2. Mock Target Staging DB (Empty matching schema for sanitized COPY load)
+  # ---------------------------------------------------------------------------
+  target-db:
+    image: postgres:16-alpine
+    container_name: sanitizedb-target-db
+    environment:
+      POSTGRES_DB: staging_app
+      POSTGRES_USER: staging_writer
+      POSTGRES_PASSWORD: staging_dev_password_only
+    ports:
+      - "5434:5432"
+    volumes:
+      - target_pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/mock-target:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data-plane-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U staging_writer -d staging_app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # 3. Control Plane DB (Organizations, Connections, Policies, Jobs, Audit Ledger)
+  # ---------------------------------------------------------------------------
+  control-plane-db:
+    image: postgres:16-alpine
+    container_name: sanitizedb-control-db
+    environment:
+      POSTGRES_DB: sanitizedb_control
+      POSTGRES_USER: sanitizedb
+      POSTGRES_PASSWORD: control_plane_dev_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - control_plane_pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/control-plane:/docker-entrypoint-initdb.d:ro
+    networks:
+      - control-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sanitizedb -d sanitizedb_control"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # 4. HashiCorp Vault (Dev Mode — Secret Store & Transit KMS)
+  # ---------------------------------------------------------------------------
+  vault:
+    image: hashicorp/vault:1.17
+    container_name: sanitizedb-vault
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: sanitizedb-dev-root-token
+      VAULT_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+    ports:
+      - "8200:8200"
+    networks:
+      - control-net
+
+  # ---------------------------------------------------------------------------
+  # 5. Rust Stream Engine (Zero-Leak In-Memory PII Masking Data Plane)
+  #    Runs with read_only root filesystem & zero writable disk mounts!
+  # ---------------------------------------------------------------------------
+  stream-engine:
+    build:
+      context: .
+      dockerfile: services/stream-engine/Dockerfile
+    container_name: sanitizedb-stream-engine
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      RUST_LOG: info,stream_engine=debug
+      GRPC_LISTEN_ADDR: 0.0.0.0:50051
+    ports:
+      - "50051:50051"
+    depends_on:
+      source-db:
+        condition: service_healthy
+      target-db:
+        condition: service_healthy
+    networks:
+      - data-plane-net
+      - control-net
+
+  # ---------------------------------------------------------------------------
+  # 6. Go Orchestrator & Real-Time WebSocket Control Plane
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator-cli/Dockerfile
+    container_name: sanitizedb-orchestrator
+    environment:
+      HTTP_ADDR: ":8080"
+      STREAM_ENGINE_GRPC_ADDR: "stream-engine:50051"
+      GOVERNANCE_CORE_URL: "http://governance-core:8081"
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "sanitizedb-dev-root-token"
+      SANITIZEDB_SOURCE_DSN: "postgres://prod_readonly:prod_dev_password_only@source-db:5432/prod_app"
+      SANITIZEDB_TARGET_DSN: "postgres://staging_writer:staging_dev_password_only@target-db:5432/staging_app"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - stream-engine
+      - vault
+    networks:
+      - control-net
+
+  # ---------------------------------------------------------------------------
+  # 7. Java 21 / Spring Boot Governance Core (RBAC, Drift Gate, Certificates)
+  # ---------------------------------------------------------------------------
+  governance-core:
+    build:
+      context: ./services/governance-core
+      dockerfile: Dockerfile
+    container_name: sanitizedb-governance-core
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://control-plane-db:5432/sanitizedb_control
+      SPRING_DATASOURCE_USERNAME: sanitizedb
+      SPRING_DATASOURCE_PASSWORD: control_plane_dev_secret
+      SERVER_PORT: 8081
+    ports:
+      - "8081:8081"
+    depends_on:
+      control-plane-db:
+        condition: service_healthy
+    networks:
+      - control-net
+
+  # ---------------------------------------------------------------------------
+  # 8. React + TypeScript Visual Schema Mapper & Rule Designer
+  # ---------------------------------------------------------------------------
+  web-console:
+    build:
+      context: ./apps/web-console
+      dockerfile: Dockerfile
+    container_name: sanitizedb-web-console
+    environment:
+      VITE_ORCHESTRATOR_URL: http://localhost:8080
+      VITE_GOVERNANCE_URL: http://localhost:8081
+    ports:
+      - "5173:5173"
+    depends_on:
+      - orchestrator
+      - governance-core
+    networks:
+      - control-net
